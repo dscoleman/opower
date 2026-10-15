@@ -3447,3 +3447,222 @@ async def test_last_batch_of_one_day_is_still_fetched(
             (date(2026, 7, 6), date(2026, 8, 1)),
             (date(2026, 7, 5), date(2026, 7, 5)),
         ]
+
+
+_FORBIDDEN = _FakeResponse(
+    {
+        "error": {
+            "httpStatus": 403,
+            "serviceErrorCode": "ACCOUNT_ACCESS_FORBIDDEN",
+            "details": "Claims did not contain any entity ids",
+        }
+    },
+    status=403,
+)
+
+
+def _aep(session: _FakeSession) -> Opower:
+    """Return an AEP Ohio client wired to a fake session and already logged in."""
+    opower = Opower(
+        session,  # type: ignore[arg-type]
+        "AEP Ohio",
+        "test",
+        "test",
+    )
+    opower._access_token = _ACCESS_TOKEN
+    return opower
+
+
+def _net_usage_response(reads: list[tuple[str, float | None]], mapped_account: str = _ELEC_ACCOUNT_UUID) -> dict[str, Any]:
+    """Build a dsm-graphql-v1 readStreams response carrying only netUsage reads."""
+    return {
+        "data": {
+            "billingAccountByAuthContext": {
+                "serviceAgreementsConnection": {
+                    "edges": [
+                        {
+                            "node": {
+                                "utilityId": "unrelated",
+                                "mappedUtilityAccounts": [{"uuid": mapped_account}],
+                                "servicePointsConnection": {
+                                    "edges": [
+                                        {
+                                            "node": {
+                                                "readStreams": {
+                                                    "netUsage": [
+                                                        {
+                                                            "reads": [
+                                                                {
+                                                                    "timeInterval": interval,
+                                                                    "measuredAmount": (
+                                                                        None if value is None else {"value": value}
+                                                                    ),
+                                                                }
+                                                                for interval, value in reads
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    ]
+                                },
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+
+class _ReadsRouter:
+    """Serve the GraphQL reads fallback and record the variables of each request."""
+
+    wants_request = True
+
+    def __init__(self, reads: Any = None, bills: Any = None) -> None:
+        """Serve `reads` for readStreams queries and `bills` for bill queries."""
+        self.reads = reads
+        self.bills = bills
+        self.read_variables: list[dict[str, Any]] = []
+        self.bill_variables: list[dict[str, Any]] = []
+
+    def __call__(self, request: dict[str, Any]) -> Any:
+        body = request.get("json") or {}
+        query = body.get("query", "")
+        variables = body.get("variables") or {}
+        if "registers" in query:
+            # The import/export probe: this account has no separate registers.
+            return {"data": {"billingAccountByAuthContext": {"serviceAgreementsConnection": {"edges": []}}}}
+        if "bills(" in query:
+            self.bill_variables.append(variables)
+            return self.bills
+        self.read_variables.append(variables)
+        return self.reads(variables) if callable(self.reads) else self.reads
+
+
+@pytest.mark.asyncio
+async def test_reads_fall_back_to_graphql_when_databrowser_is_forbidden() -> None:
+    """A utility that refuses DataBrowser-v1 is served the same reads from GraphQL."""
+    router = _ReadsRouter(
+        _net_usage_response(
+            [
+                ("2026-10-09T00:00:00-04:00/2026-10-10T00:00:00-04:00", 34.47),
+                ("2026-10-10T00:00:00-04:00/2026-10-11T00:00:00-04:00", 27.262),
+                # Not measured yet: left out rather than reported as zero.
+                ("2026-10-11T00:00:00-04:00/2026-10-12T00:00:00-04:00", None),
+            ]
+        )
+    )
+    session = _FakeSession({"DataBrowser-v1": _FORBIDDEN, "dsm-graphql-v1": router})
+    opower = _aep(session)
+    opower.utility._subdomain = "aepo"  # type: ignore[attr-defined]
+
+    result = await opower.async_get_cost_reads(
+        _elec_account(), AggregateType.DAY, datetime(2026, 10, 9), datetime(2026, 10, 11)
+    )
+
+    assert [(r.start_time.isoformat(), r.end_time.isoformat(), r.consumption, r.provided_cost) for r in result] == [
+        ("2026-10-09T00:00:00-04:00", "2026-10-10T00:00:00-04:00", 34.47, 0),
+        ("2026-10-10T00:00:00-04:00", "2026-10-11T00:00:00-04:00", 27.262, 0),
+    ]
+    # The caller already pads the range by a day and, like the REST endpoints,
+    # the window then covers the whole of its end date.
+    assert router.read_variables[0] == {
+        "customerUrn": f"urn:opower:customer:uuid:{_CUSTOMER_UUID}",
+        "timeInterval": "2026-10-09T00:00:00-04:00/2026-10-13T00:00:00-04:00",
+        "resolution": "DAY",
+    }
+
+    # Once an account is known to be refused, DataBrowser-v1 is not asked again.
+    rest_requests = sum("DataBrowser-v1" in request["url"] for request in session.requests)
+    usage = await opower.async_get_usage_reads(
+        _elec_account(), AggregateType.DAY, datetime(2026, 10, 9), datetime(2026, 10, 11)
+    )
+    assert [r.consumption for r in usage] == [34.47, 27.262]
+    assert sum("DataBrowser-v1" in request["url"] for request in session.requests) == rest_requests
+
+
+@pytest.mark.asyncio
+async def test_graphql_bill_reads_match_the_account_and_carry_cost() -> None:
+    """Bill reads from GraphQL carry usage and cost for the requested account only."""
+
+    def segment(interval: str, account: str, usage: float, charges: float | None, amount: float | None) -> dict[str, Any]:
+        return {
+            "usageInterval": interval,
+            "serviceAgreement": {"utilityId": "unrelated", "mappedUtilityAccounts": [{"uuid": account}]},
+            "serviceQuantities": [
+                {"serviceQuantityIdentifier": "NET_USAGE", "serviceQuantity": {"value": usage}},
+                {"serviceQuantityIdentifier": "DEMAND", "serviceQuantity": {"value": 9.9}},
+            ],
+            "usageCharges": None if charges is None else {"value": charges},
+            "currentAmount": None if amount is None else {"value": amount},
+        }
+
+    bills = {
+        "data": {
+            "billingAccountByAuthContext": {
+                "bills": [
+                    {
+                        "segments": [
+                            segment("2026-07-29T04:00:00Z/2026-08-27T04:00:00Z", _ELEC_ACCOUNT_UUID, 1457.0, 196.36, None),
+                            segment("2026-07-29T04:00:00Z/2026-08-27T04:00:00Z", _GAS_ACCOUNT_UUID, 12.0, 20.0, 30.0),
+                        ]
+                    },
+                    {
+                        "segments": [
+                            segment("2026-08-27T04:00:00Z/2026-09-26T04:00:00Z", _ELEC_ACCOUNT_UUID, 1501.0, 202.28, 305.44)
+                        ]
+                    },
+                ]
+            }
+        }
+    }
+    router = _ReadsRouter(bills=bills)
+    session = _FakeSession({"DataBrowser-v1": _FORBIDDEN, "dsm-graphql-v1": router})
+    opower = _aep(session)
+    opower.utility._subdomain = "aepo"  # type: ignore[attr-defined]
+
+    result = await opower.async_get_cost_reads(_elec_account(), AggregateType.BILL)
+
+    assert [(r.start_time.isoformat(), r.end_time.isoformat(), r.consumption, r.provided_cost) for r in result] == [
+        ("2026-07-29T00:00:00-04:00", "2026-08-27T00:00:00-04:00", 1457.0, 196.36),
+        # The billed amount wins when a segment carries both.
+        ("2026-08-27T00:00:00-04:00", "2026-09-26T00:00:00-04:00", 1501.0, 305.44),
+    ]
+    assert len(router.bill_variables) == 1
+
+
+@pytest.mark.asyncio
+async def test_graphql_reads_split_windows_larger_than_the_server_allows() -> None:
+    """A range over the per-request cap is walked in several requests."""
+    router = _ReadsRouter(lambda variables: _net_usage_response([(variables["timeInterval"], 1.0)]))
+    session = _FakeSession({"dsm-graphql-v1": router})
+    opower = _aep(session)
+    opower.utility._subdomain = "aepo"  # type: ignore[attr-defined]
+
+    reads = await opower._async_fetch_graphql_reads(
+        _elec_account(), AggregateType.HOUR, datetime(2026, 6, 1), datetime(2026, 7, 15)
+    )
+
+    # 45 days of hourly reads against a 720 hour cap.
+    assert [variables["timeInterval"] for variables in router.read_variables] == [
+        "2026-06-01T00:00:00-04:00/2026-07-01T00:00:00-04:00",
+        "2026-07-01T00:00:00-04:00/2026-07-16T00:00:00-04:00",
+    ]
+    assert len(reads) == 2
+
+
+@pytest.mark.asyncio
+async def test_forbidden_databrowser_error_is_kept_when_graphql_fails_too() -> None:
+    """If GraphQL cannot serve the reads either, the caller sees the original 403."""
+    session = _FakeSession({"DataBrowser-v1": _FORBIDDEN, "dsm-graphql-v1": _FakeResponse({}, status=404)})
+    opower = _aep(session)
+    opower.utility._subdomain = "aepo"  # type: ignore[attr-defined]
+
+    with pytest.raises(ApiException) as err:
+        await opower.async_get_cost_reads(_elec_account(), AggregateType.BILL)
+
+    assert err.value.status == 403
+    assert not opower._graphql_reads_accounts

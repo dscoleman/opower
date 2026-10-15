@@ -261,6 +261,49 @@ query OpowerRegisterReads($customerUrn: ID, $spUuid: String, $timeInterval: Time
 }
 """
 
+# DataBrowser-v1 is not served to every utility any more: AEP's portal moved its
+# own data browser to dsm-graphql-v1 and the REST endpoints now answer
+# 403 ACCOUNT_ACCESS_FORBIDDEN. These two queries are the GraphQL equivalent of
+# the REST reads, trimmed down from what the portal's widget sends.
+#
+# Cost is only published per bill. The read streams carry usage and nothing else,
+# so reads below bill resolution come back without a cost.
+_BILL_READS_QUERY = """
+query OpowerBillReads($customerUrn: ID, $timeInterval: TimeInterval, $last: Int) {
+  billingAccountByAuthContext(singlePremise: $customerUrn) {
+    bills(last: $last, during: $timeInterval, orderBy: ASCENDING, preserveDuplicateSegments: true) {
+      segments {
+        usageInterval
+        serviceAgreement { utilityId mappedUtilityAccounts { uuid } }
+        serviceQuantities { serviceQuantityIdentifier serviceQuantity { value } }
+        usageCharges { value }
+        currentAmount { value }
+      }
+    }
+  }
+}
+"""
+
+_NET_USAGE_READS_QUERY = """
+query OpowerNetUsageReads($customerUrn: ID, $timeInterval: TimeInterval, $resolution: ReadResolution) {
+  billingAccountByAuthContext(singlePremise: $customerUrn) {
+    serviceAgreementsConnection(first: 25, onlyActive: true) {
+      edges { node { utilityId mappedUtilityAccounts { uuid }
+        servicePointsConnection(first: 25) { edges { node {
+          readStreams(timeInterval: $timeInterval, readResolution: $resolution) {
+            netUsage { reads { timeInterval measuredAmount { value } } }
+          }
+        } } }
+      } }
+    }
+  }
+}
+"""
+
+_NET_USAGE_SQI = "NET_USAGE"
+# Far more bills than Opower keeps, so one request returns the whole history.
+_MAX_BILL_READS = 500
+
 
 # Distinguishes "not probed yet" from a cached "this account has no registers".
 _UNPROBED = object()
@@ -515,6 +558,9 @@ class Opower:
         # import/export registers", so we only ever probe once per account.
         self._register_streams: dict[str, _RegisterStreams | None] = {}
         self._warned_no_completed_bills = False
+        # Account uuids whose DataBrowser-v1 reads answered 403 and are served
+        # from dsm-graphql-v1 instead, so later windows skip the doomed request.
+        self._graphql_reads_accounts: set[str] = set()
 
     async def async_login(self) -> None:
         """Login to the utility website and authorize opower.com for access.
@@ -1935,6 +1981,8 @@ class Opower:
                 f"https://{self._get_subdomain()}.opower.com/{self._get_api_root()}"
                 f"/edge/apis/DataBrowser-v1/cws/cost/utilityAccount/{account.uuid}"
             )
+        if account.uuid in self._graphql_reads_accounts:
+            return await self._async_fetch_graphql_reads(account, aggregate_type, start_date, end_date), False
         convert_to_date = usage_only
         params = {"aggregateType": aggregate_type.value}
         headers = self._get_headers(account.customer.uuid)
@@ -1956,7 +2004,144 @@ class Opower:
             if err.status == 403 and self.utility.uses_bill_trends_for_reads() and not usage_only:
                 _LOGGER.debug("DataBrowser-v1 returned 403 for DSS, falling back to bill history: %s", err)
                 return await self._async_fetch_dss_bills(), True
+            # Utilities whose portal moved to dsm-graphql-v1 (e.g. AEP) refuse
+            # DataBrowser-v1 outright. Serve the same reads from GraphQL.
+            if err.status == 403 and not self.utility.is_dss():
+                _LOGGER.debug("DataBrowser-v1 returned 403, falling back to GraphQL reads: %s", err)
+                try:
+                    reads = await self._async_fetch_graphql_reads(account, aggregate_type, start_date, end_date)
+                except ApiException as graphql_err:
+                    _LOGGER.debug("GraphQL reads failed as well: %s", graphql_err)
+                    raise err from graphql_err
+                self._graphql_reads_accounts.add(account.uuid)
+                return reads, False
             raise
+
+    @staticmethod
+    def _graphql_agreement_matches(agreement: dict[str, Any], account: Account) -> bool:
+        """Return whether a GraphQL service agreement is the given REST account."""
+        mapped = {str(mapped.get("uuid")) for mapped in agreement.get("mappedUtilityAccounts") or [] if mapped}
+        if mapped:
+            return account.uuid in mapped
+        return str(agreement.get("utilityId") or "") == str(account.utility_account_id)
+
+    async def _async_fetch_graphql_reads(
+        self,
+        account: Account,
+        aggregate_type: AggregateType,
+        start_date: datetime | arrow.Arrow | None = None,
+        end_date: datetime | arrow.Arrow | None = None,
+    ) -> list[Any]:
+        """Fetch one window of reads from dsm-graphql-v1, shaped like DataBrowser-v1 reads.
+
+        Like the REST endpoints, the window includes the whole of end_date's day.
+        """
+        tz = await aiozoneinfo.async_get_time_zone(self.utility.timezone())
+
+        def localize(value: datetime | arrow.Arrow) -> arrow.Arrow:
+            """Return value in the utility's timezone, reading a naive datetime as local."""
+            if isinstance(value, datetime) and value.tzinfo is None:
+                return arrow.get(value, tzinfo=tz)
+            return arrow.get(value).to(tz)
+
+        start = localize(start_date) if start_date else arrow.get(2000, 1, 1, tzinfo=tz)
+        end = localize(end_date).floor("day").shift(days=1) if end_date else arrow.now(tz).shift(days=1)
+        if aggregate_type == AggregateType.BILL:
+            return await self._async_fetch_graphql_bill_reads(account, start, end, tz)
+        resolution = _READ_RESOLUTIONS.get(aggregate_type)
+        if resolution is None:
+            raise ApiException(f"GraphQL reads do not support aggregate_type: {aggregate_type}", url="")
+        read_resolution, max_window = resolution
+
+        usage_by_interval: dict[tuple[float, float], float] = {}
+        window_start = start.datetime
+        while window_start < end.datetime:
+            window_end = min(end.datetime, window_start + max_window)
+            result = await self._async_post_graphql(
+                _NET_USAGE_READS_QUERY,
+                self._get_headers(account.customer.uuid),
+                {
+                    "customerUrn": f"urn:opower:customer:uuid:{account.customer.uuid}",
+                    "timeInterval": f"{window_start.isoformat()}/{window_end.isoformat()}",
+                    "resolution": read_resolution,
+                },
+            )
+            for read_start, read_end, value in self._iter_graphql_net_usage(result, account, tz):
+                # Keyed by POSIX timestamps so the repeated hour of a DST fall-back
+                # day stays two reads. Several service points or registers behind
+                # one account add up.
+                key = (read_start.timestamp(), read_end.timestamp())
+                usage_by_interval[key] = usage_by_interval.get(key, 0) + value
+            window_start = window_end
+        return [
+            {
+                "startTime": datetime.fromtimestamp(read_start_ts, tz).isoformat(),
+                "endTime": datetime.fromtimestamp(read_end_ts, tz).isoformat(),
+                "value": usage,
+                "consumption": {"value": usage},
+                "providedCost": 0,
+            }
+            for (read_start_ts, read_end_ts), usage in sorted(usage_by_interval.items())
+        ]
+
+    def _iter_graphql_net_usage(
+        self, result: Any, account: Account, tz: ZoneInfo
+    ) -> Iterator[tuple[datetime, datetime, float]]:
+        """Yield (start, end, usage) for the account's measured netUsage reads."""
+        billing_account = (result.get("data") or {}).get("billingAccountByAuthContext") or {}
+        for agreement in (billing_account.get("serviceAgreementsConnection") or {}).get("edges") or []:
+            node = agreement.get("node") or {}
+            if not self._graphql_agreement_matches(node, account):
+                continue
+            for point in (node.get("servicePointsConnection") or {}).get("edges") or []:
+                streams = (point.get("node") or {}).get("readStreams") or {}
+                for entry in streams.get("netUsage") or []:
+                    for read in (entry or {}).get("reads") or []:
+                        read_start, read_end = _parse_time_interval(read.get("timeInterval"), tz)
+                        value = (read.get("measuredAmount") or {}).get("value")
+                        # An interval that has not been measured yet comes back null.
+                        if read_start is None or read_end is None or value is None:
+                            continue
+                        yield read_start, read_end, value
+
+    async def _async_fetch_graphql_bill_reads(
+        self, account: Account, start: arrow.Arrow, end: arrow.Arrow, tz: ZoneInfo
+    ) -> list[Any]:
+        """Fetch the account's bills from dsm-graphql-v1 as DataBrowser-v1 bill reads."""
+        result = await self._async_post_graphql(
+            _BILL_READS_QUERY,
+            self._get_headers(account.customer.uuid),
+            {
+                "customerUrn": f"urn:opower:customer:uuid:{account.customer.uuid}",
+                "timeInterval": f"{start.isoformat()}/{end.isoformat()}",
+                "last": _MAX_BILL_READS,
+            },
+        )
+        billing_account = (result.get("data") or {}).get("billingAccountByAuthContext") or {}
+        reads: list[Any] = []
+        for bill in billing_account.get("bills") or []:
+            for segment in (bill or {}).get("segments") or []:
+                if not self._graphql_agreement_matches(segment.get("serviceAgreement") or {}, account):
+                    continue
+                seg_start, seg_end = _parse_time_interval(segment.get("usageInterval"), tz)
+                if seg_start is None or seg_end is None:
+                    continue
+                quantities = segment.get("serviceQuantities") or []
+                net = [q for q in quantities if q.get("serviceQuantityIdentifier") == _NET_USAGE_SQI] or quantities
+                usage = sum(((q.get("serviceQuantity") or {}).get("value") or 0) for q in net)
+                # The amount billed for the segment; without it, the usage charges.
+                cost = (segment.get("currentAmount") or segment.get("usageCharges") or {}).get("value") or 0
+                reads.append(
+                    {
+                        "startTime": seg_start.astimezone(tz).isoformat(),
+                        "endTime": seg_end.astimezone(tz).isoformat(),
+                        "value": usage,
+                        "consumption": {"value": usage},
+                        "providedCost": cost,
+                    }
+                )
+        reads.sort(key=lambda read: datetime.fromisoformat(read["startTime"]))
+        return reads
 
     def _get_account_id(self) -> str:
         for user_account in self._user_accounts:
